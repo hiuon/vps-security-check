@@ -1,0 +1,137 @@
+- name: Secure SSH and create vps-user
+  hosts: webservers
+  become: yes
+  vars:
+    vps_user: vps-user
+    ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519_vps.pub') }}"
+  
+  tasks:
+    # --- Task Group 1: User Creation and SSH Key setup (runs as root) ---
+    - name: Ensure 'sudo' group exists
+      ansible.builtin.group:
+        name: sudo
+        state: present
+      tags: user_setup
+    
+    - name: Check if vps-user already has a password
+      ansible.builtin.shell: "sudo getent shadow {{ vps_user }} | cut -d: -f2"
+      register: user_password_status
+      changed_when: false
+      tags: user_setup
+
+    - name: Generate a random password for vps-user if not set
+      ansible.builtin.set_fact:
+        vps_user_password: "{{ lookup('ansible.builtin.password', 'length=15 chars=ascii_letters,digits,hexdigits,punctuation') }}"
+      when: user_password_status.stdout == '!'
+      tags: one_time
+
+    
+    - name: Create vps-user and add to sudo group
+      ansible.builtin.user:
+        name: "{{ vps_user }}"
+        shell: /bin/bash
+        create_home: yes
+        state: present
+        groups: sudo
+        append: yes
+        password: "{{ vps_user_password | password_hash('sha512') }}"
+      when: vps_user_password is defined
+      tags: user_setup
+
+    - name: Allow passwordless sudo for vps-user
+      ansible.builtin.lineinfile:
+        path: "/etc/sudoers.d/{{ vps_user }}"
+        line: "{{ vps_user }} ALL=(ALL) NOPASSWD:ALL"
+        create: yes
+        validate: "visudo -cf %s"
+      tags: user_setup
+    
+    - name: Add SSH key for vps-user
+      ansible.builtin.authorized_key:
+        user: "{{ vps_user }}"
+        state: present
+        key: "{{ ssh_key }}"
+      tags: user_setup
+    
+
+    # --- Task Group 2: SSH Hardening (runs as root) ---
+    - name: Disable root SSH access
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^PermitRootLogin"
+        line: "PermitRootLogin no"
+        state: present
+      notify: Restart SSH
+      tags: ssh_hardening
+
+    - name: Disable password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^PasswordAuthentication"
+        line: "PasswordAuthentication no"
+        state: present
+      notify: Restart SSH
+      tags: ssh_hardening
+
+    - name: Disable PAM authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^UsePAM"
+        line: "UsePAM no"
+        state: present
+      notify: Restart SSH
+      tags: ssh_hardening
+
+    # --- Task Group 3: Fail2Ban Installation and Configuration ---
+    - name: Install fail2ban
+      ansible.builtin.package:
+        name: fail2ban
+        state: present
+      tags: fail2ban
+
+    - name: Ensure fail2ban service is started and enabled
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: yes
+      tags: fail2ban
+
+    - name: Ensure jail.d directory exists
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: fail2ban
+
+    - name: Add custom jail configurations
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/{{ item.name }}.conf
+        content: "{{ item.content }}"
+        owner: root
+        group: root
+        mode: '0644'
+      with_items:
+        - name: sshd
+          content: |
+            [sshd]
+            enabled   = true
+            maxretry  = 3
+            findtime  = 1d
+            bantime   = 30d
+            port      = ssh
+            logpath   = %(sshd_log)s
+            backend   = %(sshd_backend)s
+      notify: Restart Fail2Ban
+      tags: fail2ban
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+    - name: Restart Fail2Ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
