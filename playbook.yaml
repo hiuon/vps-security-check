@@ -13,19 +13,6 @@
         state: present
       tags: user_setup
     
-    - name: Check if vps-user already has a password
-      ansible.builtin.shell: "sudo getent shadow {{ vps_user }} | cut -d: -f2"
-      register: user_password_status
-      changed_when: false
-      tags: user_setup
-
-    - name: Generate a random password for vps-user if not set
-      ansible.builtin.set_fact:
-        vps_user_password: "{{ lookup('ansible.builtin.password', 'length=15 chars=ascii_letters,digits,hexdigits,punctuation') }}"
-      when: user_password_status.stdout == '!'
-      tags: one_time
-
-    
     - name: Create vps-user and add to sudo group
       ansible.builtin.user:
         name: "{{ vps_user }}"
@@ -34,8 +21,6 @@
         state: present
         groups: sudo
         append: yes
-        password: "{{ vps_user_password | password_hash('sha512') }}"
-      when: vps_user_password is defined
       tags: user_setup
 
     - name: Allow passwordless sudo for vps-user
@@ -55,34 +40,23 @@
     
 
     # --- Task Group 2: SSH Hardening (runs as root) ---
-    - name: Disable root SSH access
-      ansible.builtin.lineinfile:
+    - name: Enforce SSH hardening before included configuration
+      ansible.builtin.blockinfile:
         path: /etc/ssh/sshd_config
-        regexp: "^PermitRootLogin"
-        line: "PermitRootLogin no"
-        state: present
-      notify: Restart SSH
-      tags: ssh_hardening
-
-    - name: Disable password authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: "^PasswordAuthentication"
-        line: "PasswordAuthentication no"
-        state: present
-      notify: Restart SSH
-      tags: ssh_hardening
-
-    - name: Disable PAM authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: "^UsePAM"
-        line: "UsePAM no"
-        state: present
+        insertbefore: BOF
+        marker: "# {mark} ANSIBLE MANAGED SSH HARDENING"
+        block: |
+          PermitRootLogin no
+          PasswordAuthentication no
       notify: Restart SSH
       tags: ssh_hardening
 
     # --- Task Group 3: Fail2Ban Installation and Configuration ---
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: yes
+      tags: fail2ban
+
     - name: Install fail2ban
       ansible.builtin.package:
         name: fail2ban
@@ -117,14 +91,33 @@
           content: |
             [sshd]
             enabled   = true
+            mode      = aggressive
             maxretry  = 3
             findtime  = 1d
-            bantime   = 30d
-            port      = ssh
+            bantime   = -1
+            banaction = %(banaction_allports)s
             logpath   = %(sshd_log)s
             backend   = %(sshd_backend)s
+            protocol  = tcp,udp,icmp,icmpv6,sctp,dccp,gre,esp,ah
       notify: Restart Fail2Ban
       tags: fail2ban
+
+    - name: Apply SSH configuration changes
+      ansible.builtin.meta: flush_handlers
+      tags: ssh_hardening
+
+    - name: Check effective SSH configuration
+      ansible.builtin.command: sshd -T
+      register: effective_ssh_config
+      changed_when: false
+      tags: ssh_hardening
+
+    - name: Verify SSH hardening settings
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in effective_ssh_config.stdout_lines"
+          - "'passwordauthentication no' in effective_ssh_config.stdout_lines"
+      tags: ssh_hardening
 
   handlers:
     - name: Restart SSH
