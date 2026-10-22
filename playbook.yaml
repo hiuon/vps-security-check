@@ -3,7 +3,8 @@
   become: yes
   vars:
     vps_user: vps-user
-    ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519_vps.pub') }}"
+    vps_key_file: ~/.ssh/id_ed25519_vps
+    ssh_key: "{{ lookup('file', vps_key_file + '.pub') }}"
   
   tasks:
     # --- Task Group 1: User Creation and SSH Key setup (runs as root) ---
@@ -40,6 +41,18 @@
     
 
     # --- Task Group 2: SSH Hardening (runs as root) ---
+    - name: Verify vps-user can log in with its key before disabling root login
+      ansible.builtin.command: >
+        ssh -i {{ vps_key_file | expanduser }}
+        -o BatchMode=yes -o IdentitiesOnly=yes
+        -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+        {{ vps_user }}@{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }} true
+      delegate_to: localhost
+      become: no
+      changed_when: false
+      check_mode: false
+      tags: ssh_hardening
+
     - name: Enforce SSH hardening before included configuration
       ansible.builtin.blockinfile:
         path: /etc/ssh/sshd_config
@@ -98,13 +111,18 @@
             banaction = %(banaction_allports)s
             logpath   = %(sshd_log)s
             backend   = %(sshd_backend)s
-            protocol  = tcp,udp,icmp,icmpv6,sctp,dccp,gre,esp,ah
+            protocol  = 0-255
       notify: Restart Fail2Ban
       tags: fail2ban
 
     - name: Apply SSH configuration changes
       ansible.builtin.meta: flush_handlers
       tags: ssh_hardening
+
+    - name: Verify sshd jail is running
+      ansible.builtin.command: fail2ban-client status sshd
+      changed_when: false
+      tags: fail2ban
 
     - name: Check effective SSH configuration
       ansible.builtin.command: sshd -T
